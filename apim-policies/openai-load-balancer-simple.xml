@@ -1,0 +1,47 @@
+<!--
+  APIM Policy: Simplified Load Balancer (no Event Hub dependency)
+  ================================================================
+  A stripped-down version of the load balancing policy that works
+  out-of-the-box without needing an Event Hub logger configured.
+  Use this for initial testing, then upgrade to the full version
+  when you add observability.
+-->
+<policies>
+    <inbound>
+        <base />
+
+        <!-- Route to the load-balanced backend pool -->
+        <set-backend-service backend-id="openai-pool" />
+
+        <!-- Authenticate with managed identity (Entra ID) -->
+        <authentication-managed-identity resource="https://cognitiveservices.azure.com" />
+
+        <!-- Remove client api-key header -->
+        <set-header name="api-key" exists-action="delete" />
+    </inbound>
+
+    <backend>
+        <!-- Retry on throttle (429) or server error (5xx) with failover -->
+        <retry condition="@(context.Response.StatusCode == 429 || context.Response.StatusCode >= 500)"
+               count="3"
+               interval="1"
+               delta="1"
+               max-interval="10"
+               first-fast-retry="true">
+            <set-backend-service backend-id="openai-pool" />
+            <forward-request buffer-request-body="true" />
+        </retry>
+    </backend>
+
+    <outbound>
+        <base />
+        <!-- Expose which Azure region served this request -->
+        <set-header name="x-backend-region" exists-action="override">
+            <value>@(context.Response.Headers.GetValueOrDefault("x-ms-region", "unknown"))</value>
+        </set-header>
+    </outbound>
+
+    <on-error>
+        <base />
+    </on-error>
+</policies>

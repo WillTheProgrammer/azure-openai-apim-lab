@@ -1,0 +1,125 @@
+<!--
+  APIM Policy: Azure OpenAI Load Balancing
+  =========================================
+  This policy demonstrates load balancing across two Azure OpenAI backends
+  using the APIM backend pool. It uses managed identity for authentication
+  (no API keys in the policy) and includes circuit-breaker retry logic.
+
+  Apply this policy at the API level on the "Azure OpenAI" API in APIM.
+
+  KEY CONCEPTS FOR CUSTOMER:
+  - set-backend-service routes to the "openai-pool" backend pool
+  - The pool handles round-robin (50/50 weighted) across East US & East US 2
+  - authentication-managed-identity eliminates key management
+  - retry policy provides automatic failover on 429/5xx
+  - emit-metric tracks which backend served each request (observability)
+-->
+<policies>
+    <inbound>
+        <base />
+
+        <!-- ============================================================
+             1. LOAD BALANCING — Route to the backend pool
+             The pool "openai-pool" is defined in Bicep with two backends
+             weighted 50/50. APIM handles round-robin automatically.
+             ============================================================ -->
+        <set-backend-service backend-id="openai-pool" />
+
+        <!-- ============================================================
+             2. AUTHENTICATION — Use APIM managed identity (Entra ID)
+             This replaces the api-key header with an OAuth2 bearer token.
+             The APIM MI must have "Cognitive Services OpenAI User" role
+             on both Azure OpenAI resources.
+             ============================================================ -->
+        <authentication-managed-identity resource="https://cognitiveservices.azure.com" />
+
+        <!-- Remove any client-supplied api-key to avoid confusion -->
+        <set-header name="api-key" exists-action="delete" />
+
+        <!-- ============================================================
+             3. RATE LIMITING (optional) — Protect backends
+             ============================================================ -->
+        <rate-limit-by-key calls="100"
+                          renewal-period="60"
+                          counter-key="@(context.Subscription.Id)"
+                          remaining-calls-header-name="x-ratelimit-remaining" />
+
+        <!-- ============================================================
+             4. TRACKING — Tag requests for observability
+             ============================================================ -->
+        <set-header name="x-apim-request-id" exists-action="override">
+            <value>@(context.RequestId.ToString())</value>
+        </set-header>
+    </inbound>
+
+    <backend>
+        <!-- ============================================================
+             5. RETRY with CIRCUIT BREAKER — Failover on throttle/error
+             If one backend returns 429 (throttled) or 5xx, retry on the
+             next backend in the pool. This gives automatic failover.
+             ============================================================ -->
+        <retry condition="@(context.Response.StatusCode == 429 || context.Response.StatusCode >= 500)"
+               count="3"
+               interval="1"
+               delta="1"
+               max-interval="10"
+               first-fast-retry="true">
+            <set-backend-service backend-id="openai-pool" />
+            <forward-request buffer-request-body="true" />
+        </retry>
+    </backend>
+
+    <outbound>
+        <base />
+
+        <!-- ============================================================
+             6. RESPONSE HEADERS — Expose backend info for debugging
+             ============================================================ -->
+        <set-header name="x-backend-id" exists-action="override">
+            <value>@(context.Response.Headers.GetValueOrDefault("x-ms-region", "unknown"))</value>
+        </set-header>
+
+        <!-- Emit custom metrics for monitoring which backend served the request -->
+        <set-header name="x-apim-backend-region" exists-action="override">
+            <value>@{
+                var region = context.Response.Headers.GetValueOrDefault("x-ms-region", "unknown");
+                return region;
+            }</value>
+        </set-header>
+
+        <!-- ============================================================
+             7. TOKEN USAGE TRACKING — Log token consumption per backend
+             Useful for tracking costs across regions.
+             ============================================================ -->
+        <log-to-eventhub logger-id="openai-usage-logger"
+                         partition-id="0">@{
+            var body = context.Response.Body?.As<JObject>(preserveContent: true);
+            var usage = body?["usage"];
+            return new JObject(
+                new JProperty("timestamp", DateTime.UtcNow),
+                new JProperty("request-id", context.RequestId),
+                new JProperty("backend-region", context.Response.Headers.GetValueOrDefault("x-ms-region", "unknown")),
+                new JProperty("model", body?["model"]?.ToString()),
+                new JProperty("prompt-tokens", usage?["prompt_tokens"]),
+                new JProperty("completion-tokens", usage?["completion_tokens"]),
+                new JProperty("total-tokens", usage?["total_tokens"]),
+                new JProperty("subscription", context.Subscription.Name)
+            ).ToString();
+        }</log-to-eventhub>
+    </outbound>
+
+    <on-error>
+        <base />
+        <set-header name="x-error-reason" exists-action="override">
+            <value>@(context.LastError.Message)</value>
+        </set-header>
+        <set-body>@{
+            return new JObject(
+                new JProperty("error", new JObject(
+                    new JProperty("code", context.Response.StatusCode.ToString()),
+                    new JProperty("message", "Request failed after retry. " + context.LastError.Message)
+                ))
+            ).ToString();
+        }</set-body>
+    </on-error>
+</policies>
